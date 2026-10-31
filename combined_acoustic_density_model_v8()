@@ -1,0 +1,384 @@
+function resultsTable = combined_acoustic_density_model_v8()
+% combined_acoustic_density_model_v4
+%
+% Simultaneous acoustic (size) + density (isopycnic) sorting in ONE channel.
+% Fully robust against ODE domain overshoots and parameter mismatch.
+
+clc; close all;
+fprintf('--- Running Fully Coupled Simultaneous Acoustic & Density Settling Model ---\n\n');
+
+%% ------------------------------------------------------------------------
+%  1. Channel geometry (micrometers)
+%  ------------------------------------------------------------------------
+chan.L_um       = 150000;  % TOTAL channel length, 15 cm
+chan.W_um       = 700;     % lateral (acoustic) extent, PZT-to-PZT gap
+chan.depth_um   = 475;     % channel depth (out of plane)
+
+% Vertical (density) layer boundaries -- unequal layer heights
+chan.layer_bottom_um = 250;   % highest density layer: 0 -> 250 um
+chan.layer_mid_um    = 500;   % middle density layer:  250 -> 750 um
+chan.layer_top_um    = 250;   % lowest density + cells: 750 -> 1000 um
+chan.H_um            = chan.layer_bottom_um + chan.layer_mid_um + chan.layer_top_um; % 1000 um total
+
+%% ------------------------------------------------------------------------
+%  2. Flow
+%  ------------------------------------------------------------------------
+chan.Q_total = 2.5e-10; % m^3/s
+
+%% ------------------------------------------------------------------------
+%  3. Density-layer fluids (bottom -> top)
+%  ------------------------------------------------------------------------
+y1 = chan.layer_bottom_um*1e-6;                 % 250 um in meters
+y2 = y1 + chan.layer_mid_um*1e-6;               % 750 um in meters
+y3 = y2 + chan.layer_top_um*1e-6;               % 1000 um in meters
+
+fluids = [ ...
+    makeFluid(1110, 2.2e-3, 3.6e-10, 'highest density (bottom)', 0,  y1), ...
+    makeFluid(1070, 1.4e-3, 4.1e-10, 'middle density',           y1, y2), ...
+    makeFluid(1030, 1.0e-3, 4.5e-10, 'lowest density + cells',   y2, y3)  ...
+];
+
+%% ------------------------------------------------------------------------
+%  4. PZT / tilted-channel acoustic zone
+%  ------------------------------------------------------------------------
+pzt.theta_deg     = 15;                        % channel tilt relative to PZT wavefronts
+pzt.theta         = deg2rad(pzt.theta_deg);
+pzt.lambda        = 200e-6;                    % acoustic wavelength in fluid (~7.4 MHz)
+pzt.k             = 2*pi/pzt.lambda;
+pzt.L_acoustic_um = 9000;                      % acoustic zone length
+pzt.x_start_um    = chan.L_um - pzt.L_acoustic_um; % PZTs sit at channel outlet
+pzt.beta_p        = 2.16e-10;                  % particle compressibility
+pzt.p0_bar        = 0.36;                      % acoustic pressure amplitude (bar)
+pzt.p0            = pzt.p0_bar*1e5;            % Pa
+pzt.alpha  = 0.10;
+pzt.rho_s  = 4650;
+pzt.cs     = 3997;
+pzt.Aw     = pzt.L_acoustic_um*1e-6 * chan.depth_um*1e-6;
+Pin_W_est  = pzt.p0^2 * pzt.Aw / (pzt.alpha*pzt.rho_s*pzt.cs);
+fprintf('Estimated electrical drive: %.2f mW (%.1f dBm)\n', ...
+    Pin_W_est*1e3, 10*log10(Pin_W_est/1e-3));
+fprintf('Suggested drive frequency: %.2f MHz\n', 1480/pzt.lambda*1e-6);
+
+%% ------------------------------------------------------------------------
+%  5. Cells to test
+%  ------------------------------------------------------------------------
+z0_um = -50;                             
+y0_um = chan.H_um - chan.layer_top_um/2;     % center of top layer
+particles = [ ...
+    makeParticle(10, 1050, y0_um, z0_um, '10um / rho1050 (small, low-density)'), ...
+    makeParticle(15, 1050, y0_um, z0_um, '15um / rho1050 (medium, low-density)'), ...
+    makeParticle(22, 1050, y0_um, z0_um, '22um / rho1050 (large, low-density)'), ...
+    makeParticle(10, 1090, y0_um, z0_um, '10um / rho1090 (small, high-density)'), ...
+    makeParticle(15, 1090, y0_um, z0_um, '15um / rho1090 (medium, high-density)'), ...
+    makeParticle(22, 1090, y0_um, z0_um, '22um / rho1090 (large, high-density)')  ...
+];
+
+%% ------------------------------------------------------------------------
+%  6. Run simulation
+%  ------------------------------------------------------------------------
+colors = lines(numel(particles));
+n = numel(particles);
+label_cell  = cell(n,1);
+diam_um     = zeros(n,1);
+rho         = zeros(n,1);
+y_final     = zeros(n,1);
+z_final     = zeros(n,1);
+density_lbl = cell(n,1);
+size_lbl    = cell(n,1);
+outlet_cell = cell(n,1);
+trajs       = cell(n,1);
+
+for i = 1:n
+    p = particles(i);
+    traj = runCombinedStage(p, chan, fluids, pzt);
+    trajs{i} = traj;
+    y_final(i) = traj.y_um(end);
+    z_final(i) = traj.z_um(end);
+    if y_final(i) >= chan.H_um/2
+        density_lbl{i} = 'Low density';
+    else
+        density_lbl{i} = 'High density';
+    end
+    if z_final(i) >= 0
+        size_lbl{i} = 'Migrated (larger)';
+    else
+        size_lbl{i} = 'Unmigrated (smaller)';
+    end
+    label_cell{i}  = p.label;
+    diam_um(i)     = p.diameter_um;
+    rho(i)         = p.rho;
+    outlet_cell{i} = sprintf('%s - %s', density_lbl{i}, size_lbl{i});
+    fprintf('%s: y_final=%.1fum (%s), z_final=%.1fum (%s) -> %s\n', ...
+        p.label, y_final(i), density_lbl{i}, z_final(i), size_lbl{i}, outlet_cell{i});
+end
+
+%% ------------------------------------------------------------------------
+%  7. Visualization Plots
+%  ------------------------------------------------------------------------
+figure('Color','w','Position',[100 100 1200 450]);
+hold on; box on;
+plotChannelTopView(chan);
+for i = 1:n
+    plot(trajs{i}.x_um, trajs{i}.z_um, '-', 'LineWidth',1.6, 'Color', colors(i,:), ...
+        'DisplayName', particles(i).label);
+    scatter(trajs{i}.x_um(end), trajs{i}.z_um(end), 100, colors(i,:), 'p', 'filled', ...
+        'MarkerEdgeColor','k', 'HandleVisibility','off');
+end
+xlabel('x, along flow (um)'); ylabel('z, lateral / PZT axis (um)');
+title('Top-down View (Full Channel)');
+legend('Location','eastoutside'); grid on;
+
+figure('Color','w','Position',[100 350 1200 450]);
+hold on; box on;
+for i = 1:n
+    plot(trajs{i}.x_um, trajs{i}.z_um, '-', 'LineWidth',1.8, 'Color', colors(i,:), ...
+        'DisplayName', particles(i).label);
+    scatter(trajs{i}.x_um(end), trajs{i}.z_um(end), 120, colors(i,:), 'p', 'filled', ...
+        'MarkerEdgeColor','k', 'HandleVisibility','off');
+end
+plot([pzt.x_start_um pzt.x_start_um], [-chan.W_um/2 chan.W_um/2], 'k--', 'LineWidth',1.2);
+text(pzt.x_start_um, chan.W_um/2+30, 'PZTs start here', 'FontSize',9);
+plot([pzt.x_start_um chan.L_um], [0 0], 'k:');
+xlabel('x, along flow (um)'); ylabel('z, lateral / PZT axis (um)');
+title('Zoomed View: Acoustic Migration Zone');
+xlim([pzt.x_start_um - 500, chan.L_um + 500]);
+ylim([-chan.W_um/2-100, chan.W_um/2+100]);
+legend('Location','eastoutside'); grid on;
+
+figure('Color','w','Position',[100 600 1200 450]);
+hold on; box on;
+plotChannelSideView(chan);
+for i = 1:n
+    plot(trajs{i}.x_um, trajs{i}.y_um, '-', 'LineWidth',1.6, 'Color', colors(i,:), ...
+        'DisplayName', particles(i).label);
+    scatter(trajs{i}.x_um(end), trajs{i}.y_um(end), 100, colors(i,:), 'p', 'filled', ...
+        'MarkerEdgeColor','k', 'HandleVisibility','off');
+end
+xlabel('x, along flow (um)'); ylabel('y, vertical / density axis (um)');
+title('Side View: Isopycnic Settling Dynamics');
+legend('Location','eastoutside'); grid on;
+
+figure('Color','w','Position',[700 100 550 550]);
+hold on; box on; axis equal;
+plotExitQuadrants(chan);
+for i = 1:n
+    scatter(z_final(i), y_final(i), 160, colors(i,:), 'p', 'filled', ...
+        'MarkerEdgeColor','k', 'DisplayName', particles(i).label);
+end
+xlabel('z at exit (um)'); ylabel('y at exit (um)');
+title('Exit Face Separation Manifold');
+legend('Location','eastoutside');
+
+%% ------------------------------------------------------------------------
+%  8. Export Results Table
+%  ------------------------------------------------------------------------
+resultsTable = table(label_cell, diam_um, rho, y_final, z_final, ...
+    density_lbl, size_lbl, outlet_cell, ...
+    'VariableNames', {'Label','Diameter_um','Density_kg_m3', ...
+    'FinalY_um','FinalZ_um','DensityClass','SizeClass','Outlet'});
+disp(resultsTable);
+end
+
+%% ========================================================================
+%  Core Trajectory Solver
+%  ========================================================================
+function traj = runCombinedStage(particle, chan, fluids, pzt)
+H = chan.H_um * 1e-6;
+L = chan.L_um * 1e-6;
+W = chan.W_um * 1e-6;
+Rp = particle.diameter_um * 1e-6 / 2;
+
+u_avg = chan.Q_total / (H * W);
+u_max = u_avg * 2.25; 
+
+y_target = getIsopycnicTargetY(particle.rho, H, fluids);
+XYZ0 = [0; particle.y0_um*1e-6; particle.z0_um*1e-6];
+
+opts = odeset('RelTol', 1e-7, 'AbsTol', 1e-9, ...
+    'Events', @(t,XYZ) stopAtX(t,XYZ,L));
+
+[~, sol] = ode45(@(t,XYZ) combinedODE(t,XYZ,Rp,particle.rho,fluids,pzt,u_max,y_target,W,H,L), ...
+    [0 5000], XYZ0, opts);
+
+% Clamp x coordinates strictly within channel length bounds
+sol(:,1) = min(sol(:,1), L);
+
+traj.x_um = sol(:,1) * 1e6;
+traj.y_um = sol(:,2) * 1e6;
+traj.z_um = sol(:,3) * 1e6;
+end
+
+function dXYZdt = combinedODE(~, XYZ, Rp, rho_p, fluids, pzt, u_max, y_target, W, H, L)
+x = XYZ(1); 
+y = max(0, min(H, XYZ(2))); % Clamp height to physical domain
+z = max(-W/2, min(W/2, XYZ(3))); % Clamp width to channel walls
+
+% Check if particle has reached the end of the channel
+if x >= L
+    dXYZdt = [0; 0; 0];
+    return;
+end
+
+% Continuous fluid properties at height y
+rho_f  = getContinuousFluidDensity(y, fluids);
+mu_f   = getContinuousFluidViscosity(y, fluids);
+beta_f = getContinuousFluidCompressibility(y, fluids);
+
+% 2D Viscosity-adjusted Parabolic Flow Velocity
+y_norm = (y - H/2) / (H/2);
+z_norm = z / (W/2);
+mu_top = fluids(3).mu; 
+ux_flow = u_max * max(0, 1 - y_norm^2) * max(0, 1 - z_norm^2) * (mu_top / mu_f);
+
+% Continuous Isopycnic Settling Rate
+g = 9.81;
+dydt = -(2/9) * g * (Rp^2) * (rho_p - rho_f) / mu_f;
+
+if (rho_p > rho_f && y <= y_target) || (rho_p < rho_f && y >= y_target) || abs(y - y_target) < 1e-7
+    dydt = 0;
+end
+
+% Acoustic Force Balance inside PZT region
+if x >= pzt.x_start_um*1e-6
+    x_local = x - pzt.x_start_um*1e-6;
+    [dxdt_acoustic, dzdt] = pztAcousticForceBalance(x_local, z, Rp, rho_p, rho_f, mu_f, beta_f, pzt);
+else
+    dxdt_acoustic = 0;
+    dzdt = 0;
+end
+
+dxdt = ux_flow + dxdt_acoustic;
+
+% Boundary conditions at channel walls
+if (z >= W/2 && dzdt > 0) || (z <= -W/2 && dzdt < 0)
+    dzdt = 0;
+end
+if (y >= H && dydt > 0) || (y <= 0 && dydt < 0)
+    dydt = 0;
+end
+
+dXYZdt = [dxdt; dydt; dzdt];
+end
+
+%% ========================================================================
+%  Property Interpolation & Mechanics Functions
+%  ========================================================================
+function rho_f = getContinuousFluidDensity(y, fluids)
+delta = 10e-6; 
+rho_f = fluids(1).rho;
+for f = 1:(numel(fluids)-1)
+    y_int = fluids(f).y_max;
+    d_rho = fluids(f+1).rho - fluids(f).rho;
+    rho_f = rho_f + 0.5 * d_rho * (1 + tanh((y - y_int) / delta));
+end
+end
+
+function mu_f = getContinuousFluidViscosity(y, fluids)
+delta = 10e-6; 
+mu_f = fluids(1).mu;
+for f = 1:(numel(fluids)-1)
+    y_int = fluids(f).y_max;
+    d_mu = fluids(f+1).mu - fluids(f).mu;
+    mu_f = mu_f + 0.5 * d_mu * (1 + tanh((y - y_int) / delta));
+end
+end
+
+function beta_f = getContinuousFluidCompressibility(y, fluids)
+delta = 10e-6; 
+beta_f = fluids(1).beta;
+for f = 1:(numel(fluids)-1)
+    y_int = fluids(f).y_max;
+    d_beta = fluids(f+1).beta - fluids(f).beta;
+    beta_f = beta_f + 0.5 * d_beta * (1 + tanh((y - y_int) / delta));
+end
+end
+
+function [dx_acoustic, dz] = pztAcousticForceBalance(x, z, Rp, rho_p, rho_f, mu_f, beta_f, pzt)
+C = (5*rho_p - 2*rho_f)/(2*rho_p + rho_f) - (pzt.beta_p/beta_f); 
+r = Rp;
+p0 = pzt.p0;
+lambda = pzt.lambda;
+theta = pzt.theta;
+wave_arg  = (4*pi/lambda) * (sin(theta)*x - cos(theta)*z);
+ForceTerm = C * (4*pi^2 * p0^2 * r^3 * beta_f/(6*lambda)) * sin(wave_arg);
+
+dx_acoustic = -ForceTerm*sin(theta) / (6*pi*mu_f*r);
+dz          =  ForceTerm*cos(theta) / (6*pi*mu_f*r);
+end
+
+function [value, isterminal, direction] = stopAtX(~, XYZ, Xstop)
+value = XYZ(1) - Xstop;
+isterminal = 1;
+direction = 1;
+end
+
+function y_target = getIsopycnicTargetY(rho_p, H, fluids)
+[~, order] = sort([fluids.y_min], 'ascend');
+fluids = fluids(order);
+rho_bottom = fluids(1).rho; rho_middle = fluids(2).rho; rho_top = fluids(3).rho;
+if rho_p <= rho_top
+    y_target = H;
+elseif rho_p <= rho_middle
+    y_target = fluids(3).y_min;
+elseif rho_p <= rho_bottom
+    y_target = fluids(2).y_min;
+else
+    y_target = 0;
+end
+end
+
+%% ========================================================================
+%  Helper Constructors & Plotting Support
+%  ========================================================================
+function p = makeParticle(diameter_um, rho, y0_um, z0_um, label)
+p = struct('diameter_um', diameter_um, 'rho', rho, 'y0_um', y0_um, 'z0_um', z0_um, 'label', label);
+end
+
+function f = makeFluid(rho, mu, beta, label, y_min, y_max)
+f = struct('rho', rho, 'mu', mu, 'beta', beta, 'label', label, 'y_min', y_min, 'y_max', y_max);
+end
+
+function plotChannelTopView(chan)
+rectangle('Position',[0, -chan.W_um/2, chan.L_um, chan.W_um], ...
+    'EdgeColor',[0.25 0.25 0.25], 'LineWidth',1.2);
+rectangle('Position',[0, -chan.W_um/2-60, chan.L_um, 40], ...
+    'FaceColor',[1.0 0.75 0.75], 'EdgeColor','none');
+rectangle('Position',[0,  chan.W_um/2+20, chan.L_um, 40], ...
+    'FaceColor',[1.0 0.75 0.75], 'EdgeColor','none');
+text(500, -chan.W_um/2-100, 'PZT', 'FontSize',9);
+text(500,  chan.W_um/2+90,  'PZT', 'FontSize',9);
+plot([0 chan.L_um], [0 0], 'k:');
+xlim([-2000, chan.L_um+2000]);
+ylim([-chan.W_um/2-150, chan.W_um/2+150]);
+end
+
+function plotChannelSideView(chan)
+rectangle('Position',[0, 0, chan.L_um, chan.layer_bottom_um], ...
+    'FaceColor',[0.70 0.85 1.00], 'EdgeColor','none');
+rectangle('Position',[0, chan.layer_bottom_um, chan.L_um, chan.layer_mid_um], ...
+    'FaceColor',[0.80 0.90 1.00], 'EdgeColor','none');
+rectangle('Position',[0, chan.layer_bottom_um + chan.layer_mid_um, chan.L_um, chan.layer_top_um], ...
+    'FaceColor',[0.90 0.95 1.00], 'EdgeColor','none');
+rectangle('Position',[0, 0, chan.L_um, chan.H_um], ...
+    'EdgeColor',[0.25 0.25 0.25], 'LineWidth',1.2);
+plot([0 chan.L_um], [chan.layer_bottom_um chan.layer_bottom_um], 'k:');
+plot([0 chan.L_um], [chan.layer_bottom_um+chan.layer_mid_um chan.layer_bottom_um+chan.layer_mid_um], 'k:');
+text(500, chan.H_um - chan.layer_top_um/2, 'lowest density + cells', 'FontSize',8);
+text(500, chan.layer_bottom_um + chan.layer_mid_um/2, 'middle density', 'FontSize',8);
+text(500, chan.layer_bottom_um/2, 'highest density', 'FontSize',8);
+xlim([-2000, chan.L_um+2000]);
+ylim([-100, chan.H_um+100]);
+end
+
+function plotExitQuadrants(chan)
+W = chan.W_um; H = chan.H_um;
+rectangle('Position',[-W/2, 0, W, H], 'EdgeColor',[0.25 0.25 0.25], 'LineWidth',1.5);
+plot([0 0], [0 H], 'k--', 'LineWidth',1.2);
+plot([-W/2 W/2], [H/2 H/2], 'k--', 'LineWidth',1.2);
+text(-W/4, 3*H/4, {'Low density','Unmigrated (small)'}, 'HorizontalAlignment','center','FontSize',9);
+text( W/4, 3*H/4, {'Low density','Migrated (medium)'}, 'HorizontalAlignment','center','FontSize',9);
+text(-W/4, H/4,   {'High density','Unmigrated (small)'}, 'HorizontalAlignment','center','FontSize',9);
+text( W/4, H/4,   {'High density','Migrated (medium)'}, 'HorizontalAlignment','center','FontSize',9);
+xlim([-W/2-100, W/2+100]);
+ylim([-100, H+100]);
+end
